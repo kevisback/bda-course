@@ -216,3 +216,13 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# --- Course: API keys / secrets (public repo - never commit keys) ---
+#   .env / .envrc / secrets.toml are already covered above. These catch the
+#   likely classroom cases where a key is pasted into an ad-hoc file.
+*.key
+*.pem
+secrets.*
+api_key*
+apikey*
+*_secret*
