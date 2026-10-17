@@ -16,6 +16,10 @@ Neu in Sitzung 3:
   CACHE             Antworten bei temperature=0 werden gemerkt
   simulation()      Mock mit künstlicher Latenz und Störungen
   ist_voruebergehend()  lohnt sich ein neuer Versuch?
+
+Neu in Sitzung 4:
+  mit_retry(), parse_batch(), classify_many()   Musterlösungen aus Sitzung 3
+  export_roh()      derselbe Korpus als unordentlicher Shop-Export (+ Wahrheit)
 """
 import contextlib
 import json
@@ -154,7 +158,7 @@ def sample_from_logits(logits, temperature):
     return int(np.random.choice(len(logits), p=probs))
 
 
-_ZEILE_MIT_ID = re.compile(r"^\s*(R\d{4}):\s?(.*)$")
+_ZEILE_MIT_ID = re.compile(r"^\s*([A-Z]\d{4,5}):\s?(.*)$")
 
 
 def _mock_call(system, user, temperature, max_tokens):
@@ -403,3 +407,172 @@ def generate(n=300, seed=SEED):
             rows.append(dict(rows[src], review_id=f"R{n+j:04d}"))
     rng.shuffle(rows)
     return rows
+
+
+# ---------------------------------------------------------------------------
+# Musterlösungen aus Sitzung 3: Wiederholen, Batching
+# ---------------------------------------------------------------------------
+def mit_retry(fn, *args, versuche=5, basis=0.5, **kwargs):
+    """Wiederholt fn bei vorübergehenden Fehlern, mit exponentieller Wartezeit + Jitter."""
+    for k in range(versuche):
+        try:
+            return fn(*args, **kwargs)
+        except Exception as e:
+            if not ist_voruebergehend(e) or k == versuche - 1:
+                raise
+            time.sleep(basis * 2**k * random.uniform(0.5, 1.5))
+
+
+BATCH_PROMPT = """Du klassifizierst Produktbewertungen nach Sentiment.
+
+Labels:
+- positive: überwiegend Lob, keine nennenswerte Kritik
+- negative: überwiegend Kritik, auch wenn sie positiv formuliert ist (Sarkasmus)
+- mixed: konkretes Lob UND konkrete Kritik zu verschiedenen Aspekten
+- neutral: weder klar positiv noch negativ, reine Feststellung
+
+Du bekommst mehrere Bewertungen, jede mit ID. Bewerte jede einzeln.
+Antworte ausschließlich mit einer JSON-Liste, eine Zeile pro Bewertung, in derselben Reihenfolge:
+[{"id": "<ID>", "sentiment": "<label>"}, ...]"""
+
+
+def parse_batch(raw, ids):
+    ergebnis = {i: "missing" for i in ids}
+    m = re.search(r"\[.*\]", raw or "", re.DOTALL)
+    try:
+        items = json.loads(m.group(0)) if m else None
+    except json.JSONDecodeError:
+        items = None
+    if not isinstance(items, list):
+        return {i: "invalid" for i in ids}
+    for item in items:
+        if not isinstance(item, dict) or item.get("id") not in ergebnis:
+            continue
+        label = str(item.get("sentiment", "")).strip().lower()
+        ergebnis[item["id"]] = label if label in LABELS else "invalid"
+    return ergebnis
+
+
+def classify_many(ids, texte, batch=20):
+    """Ordnet viele Bewertungen in Batches ein; Lücken werden einzeln nachgeholt.
+    ids und texte: gleich lange Listen. Rückgabe: Liste von Labels in derselben Reihenfolge.
+    IDs müssen innerhalb eines Batches eindeutig sein; doppelte werden intern umbenannt."""
+    ids, texte = list(ids), list(texte)
+    schluessel = [f"X{i:05d}" for i in range(len(ids))]   # eindeutig, egal wie die echten IDs aussehen
+    labels = {}
+    for start in range(0, len(texte), batch):
+        k = schluessel[start:start + batch]
+        t = texte[start:start + batch]
+        liste = "\n".join(f"{a}: {' '.join(str(b).split())}" for a, b in zip(k, t))
+        user = f'Bewertungen:\n"""\n{liste}\n"""'
+        antwort = mit_retry(call_llm, user, system=BATCH_PROMPT, temperature=0,
+                            max_tokens=25 * len(k) + 100)
+        teil = parse_batch(antwort["text"], k)
+        for a, b in zip(k, t):
+            if teil[a] in ("missing", "invalid"):
+                try:
+                    teil[a] = mit_retry(classify, b, temperature=0)
+                except Exception:
+                    teil[a] = "error"
+        labels.update(teil)
+    return [labels[k] for k in schluessel]
+
+
+# ---------------------------------------------------------------------------
+# Sitzung 4: derselbe Korpus als unordentlicher Shop-Export
+# ---------------------------------------------------------------------------
+def _mojibake(text):
+    """UTF-8-Text, der fälschlich als Latin-1 gelesen wurde: 'ä' -> 'Ã¤'."""
+    return text.encode("utf-8").decode("latin-1")
+
+
+def export_roh(seed=7):
+    """Gibt (roh, wahrheit) zurück.
+
+    roh:      DataFrame, alle Spalten als Text, wie aus einem CSV-Export
+              (Spalten: review_id, quelle, datum, produkt, sterne, text)
+    wahrheit: DataFrame je review_id mit den echten Werten und den Wahrheits-Markern
+              (nur für den Kurs; in echten Daten gibt es sie nicht)
+    """
+    import pandas as pd
+    rng = random.Random(seed)
+    basis = generate(300)
+    zeilen, wahr = [], []
+    for r in basis:
+        quelle = rng.choices(["web", "app_de", "app_us"], weights=[55, 30, 15])[0]
+        d = date.fromisoformat(r["date"])
+        stunde, minute = rng.randrange(7, 23), rng.randrange(60)
+        # Datum je Quelle in eigenem Format; Web teils als Zeitstempel
+        if rng.random() < 0.03:
+            datum = ""
+        elif quelle == "web":
+            datum = (f"{d.isoformat()}T{stunde:02d}:{minute:02d}:00Z" if rng.random() < 0.3
+                     else d.isoformat())
+        elif quelle == "app_de":
+            datum = d.strftime("%d.%m.%Y")
+        else:
+            datum = d.strftime("%m/%d/%Y")
+        # Sterne: fehlen bei negativen Bewertungen deutlich häufiger
+        p_fehlt = 0.40 if r["true_sentiment"] == "negative" else 0.05
+        s = r["rating"]
+        if rng.random() < p_fehlt:
+            sterne = rng.choice(["", "", "k.A.", "null"])
+        elif quelle == "web":
+            sterne = rng.choice([str(s), str(s), f"{s} Sterne"])
+        elif quelle == "app_de":
+            sterne = f"{s},0"
+        else:
+            sterne = rng.choice([f"{s}.0", "★" * s + "☆" * (5 - s)])
+        produkt = rng.choices(["Nimbus Q2", "Nimbus Q2 ", "NIMBUS Q2", "Nimbus-Q2",
+                               "Nimbus Q2 (Schwarz)"], weights=[70, 8, 8, 7, 7])[0]
+        text = r["text"]
+        if quelle == "web" and text.strip():
+            if rng.random() < 0.25:   # altes Shop-System: Sonderzeichen als HTML-Entities
+                for a, b in [("ä", "&auml;"), ("ö", "&ouml;"), ("ü", "&uuml;"), ("ß", "&szlig;"),
+                             ("Ä", "&Auml;"), ("Ü", "&Uuml;"), ("–", "&ndash;")]:
+                    text = text.replace(a, b)
+            if rng.random() < 0.15:
+                text = text.replace(". ", ".<br>", 1)
+        if rng.random() < 0.05 and any(ch in text for ch in "äöüßÄÖÜ–"):
+            text = _mojibake(text)
+        if rng.random() < 0.2:
+            text = rng.choice(["  ", " ", "\t"]) + text + rng.choice(["", " ", "  ", "\n"])
+        zeilen.append({"review_id": r["review_id"], "quelle": quelle, "datum": datum,
+                       "produkt": produkt, "sterne": sterne, "text": text})
+        wahr.append({"review_id": r["review_id"], "datum_wahr": r["date"], "sterne_wahr": s,
+                     "text_wahr": r["text"], "true_sentiment": r["true_sentiment"],
+                     "is_sarcastic": r["is_sarcastic"], "is_fake": r["is_fake"],
+                     "is_english": any(r["text"] == e for e, _ in ENGLISH),
+                     "duplikat_von": None})
+    # Die 3 Duplikate des Generators: gleicher Text, neue ID
+    original = {(w["text_wahr"], w["datum_wahr"], w["sterne_wahr"]): w["review_id"]
+                for w in wahr if w["review_id"] < f"R{300:04d}"}
+    for w in wahr:
+        if w["review_id"] >= f"R{300:04d}":
+            w["duplikat_von"] = original[(w["text_wahr"], w["datum_wahr"], w["sterne_wahr"])]
+    # 6 Beinahe-Duplikate: dieselbe Bewertung über eine zweite Quelle erneut exportiert
+    kandidaten = [i for i, w in enumerate(wahr)
+                  if len(w["text_wahr"]) > 25 and not w["is_fake"] and w["duplikat_von"] is None]
+    for j, i in enumerate(rng.sample(kandidaten, 6)):
+        z, w = dict(zeilen[i]), dict(wahr[i])
+        t = " ".join(w["text_wahr"].split())
+        if j < 4:
+            t = [t.lower(), t.rstrip(".") + "!", t.replace(":", " -"), t + " "][j]
+        else:   # Tippfehler: zwei Buchstaben in einem Wort vertauscht
+            woerter = t.split()
+            k = max(range(len(woerter)), key=lambda x: len(woerter[x]) if x % 2 == j % 2 else 0)
+            wo = woerter[k]; woerter[k] = wo[:2] + wo[3] + wo[2] + wo[4:]
+            t = " ".join(woerter)
+        neu = f"A{j:04d}"
+        z.update(review_id=neu, quelle="app_de", text=t,
+                 datum=date.fromisoformat(w["datum_wahr"]).strftime("%d.%m.%Y"),
+                 sterne="" if z["sterne"] in ("", "k.A.", "null") else f"{w['sterne_wahr']},0")
+        w.update(review_id=neu, duplikat_von=wahr[i]["review_id"])
+        zeilen.append(z); wahr.append(w)
+    # 2 Zeilen doppelt, weil zwei Exporte überlappen: komplett identisch
+    for i in rng.sample(range(len(basis)), 2):
+        zeilen.append(dict(zeilen[i]))
+    rng.shuffle(zeilen)
+    roh = pd.DataFrame(zeilen)
+    wahrheit = pd.DataFrame(wahr).set_index("review_id")
+    return roh, wahrheit
