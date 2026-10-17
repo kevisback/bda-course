@@ -20,6 +20,11 @@ Neu in Sitzung 3:
 Neu in Sitzung 4:
   mit_retry(), parse_batch(), classify_many()   Musterlösungen aus Sitzung 3
   export_roh()      derselbe Korpus als unordentlicher Shop-Export (+ Wahrheit)
+
+Neu in Sitzung 5:
+  lade_sauber()     der bereinigte Datensatz aus Sitzung 4, in einem Aufruf
+  THEMEN, wahre_themen()   Themen-Katalog und Wahrheit je Bewertung
+  embed()           Texte -> Vektoren (Sentence-Transformers, sonst Ersatz)
 """
 import contextlib
 import json
@@ -166,6 +171,14 @@ def _mock_call(system, user, temperature, max_tokens):
     block = bloecke[-1] if bloecke else user
     T = 1.0 if temperature is None else temperature
     zeilen = [m.groups() for m in map(_ZEILE_MIT_ID.match, block.splitlines()) if m]
+    if zeilen and '"thema"' in (system or ""):
+        # Themen-Batch: [{"id": ..., "themen": [{"thema": ..., "polaritaet": ...}]}]
+        items = [{"id": rid, "themen": _mock_themen(t)} for rid, t in zeilen]
+        text = json.dumps(items, ensure_ascii=False)
+        time.sleep(MOCK_LATENZ * (1 + 0.05 * len(zeilen)))
+        est = lambda s: max(1, len(s) // 4)
+        return {"text": text, "input_tokens": est((system or "") + user), "output_tokens": est(text),
+                "stop_reason": "end_turn", "model": "mock", "raw": None}
     if len(zeilen) >= 2:
         # Batch: mehrere Bewertungen mit ID -> JSON-Liste. Lässt manchmal eine aus,
         # wie echte Modelle bei langen Listen.
@@ -576,3 +589,191 @@ def export_roh(seed=7):
     roh = pd.DataFrame(zeilen)
     wahrheit = pd.DataFrame(wahr).set_index("review_id")
     return roh, wahrheit
+
+
+# ---------------------------------------------------------------------------
+# Sitzung 5: Bereinigter Datensatz (Pipeline aus Sitzung 4, ohne LLM)
+# ---------------------------------------------------------------------------
+def _normalisiere(t):
+    t = t.casefold()
+    t = re.sub(r"[^\w\s]", " ", t)
+    return " ".join(t.split())
+
+
+def _repariere_text(t):
+    import html as _html
+    import unicodedata
+    t = _html.unescape(t)
+    t = re.sub(r"<br\s*/?>", " ", t)
+    if "Ã" in t or "â" in t:
+        try:
+            t = t.encode("latin-1").decode("utf-8")
+        except UnicodeError:
+            pass
+    return " ".join(unicodedata.normalize("NFC", t).split())
+
+
+def _parse_sterne(s):
+    s = (s or "").strip()
+    if s.lower() in {"", "k.a.", "null", "n/a", "-"}:
+        return None
+    if set(s) <= set("★☆"):
+        n = s.count("★")
+    else:
+        m = re.match(r"^(\d+(?:[.,]\d+)?)", s)
+        if not m:
+            return None
+        n = float(m.group(1).replace(",", "."))
+    return int(n) if n == int(n) and 1 <= n <= 5 else None
+
+
+def _ist_spam(t):
+    signale = [r"www\.|https?://", r"\blink\b", r"\bcode\b|rabatt|gutschein", r"klick",
+               r"!!!", r"\+\+\+", r"\bkauf(t|en)\b.*\bkauf"]
+    buchstaben = [c for c in t if c.isalpha()]
+    gross = sum(c.isupper() for c in buchstaben) / max(1, len(buchstaben))
+    return any(re.search(p, t.lower()) for p in signale) or gross > 0.5
+
+
+def lade_sauber():
+    """Bereinigter Datensatz wie am Ende von Sitzung 4. Gibt (sauber, wahrheit) zurück."""
+    import pandas as pd
+    roh, wahrheit = export_roh()
+    roh = roh[~roh.duplicated()].reset_index(drop=True)
+    fmt = {"web": "%Y-%m-%d", "app_de": "%d.%m.%Y", "app_us": "%m/%d/%Y"}
+    df = pd.DataFrame({
+        "review_id": roh["review_id"],
+        "quelle": roh["quelle"],
+        "datum": [pd.to_datetime(d.strip()[:10] if q == "web" else d.strip(), format=fmt[q],
+                                 errors="coerce") if d.strip() else pd.NaT
+                  for d, q in zip(roh["datum"], roh["quelle"])],
+        "sterne": pd.array([_parse_sterne(x) for x in roh["sterne"]], dtype="Int64"),
+        "text": roh["text"].map(_repariere_text),
+    })
+    df["text_norm"] = df["text"].map(_normalisiere)
+    weg = df.duplicated(subset=["text_norm", "datum", "sterne"]) & (df["text_norm"] != "")
+    # Beinahe-Duplikate (Tippfehler): gleiche Metadaten + sehr ähnlicher Text
+    sh = [{t[i:i + 3] for i in range(len(t) - 2)} for t in df["text_norm"]]
+    for i in range(len(df)):
+        for j in range(i + 1, len(df)):
+            if weg[j] or df.at[i, "datum"] != df.at[j, "datum"]:
+                continue
+            si, sj = df.at[i, "sterne"], df.at[j, "sterne"]
+            if (pd.isna(si) or pd.isna(sj)) and not (pd.isna(si) and pd.isna(sj)):
+                continue
+            if not pd.isna(si) and si != sj:
+                continue
+            u = sh[i] | sh[j]
+            if u and len(sh[i] & sh[j]) / len(u) >= 0.85:
+                weg[j] = True
+    muell = df["text_norm"].map(lambda n: len(n) < 3 or n in {"n a", "test", "kein kommentar", "keine angabe"})
+    spam = df["text"].map(_ist_spam)
+    sauber = df[~(weg | muell | spam)].drop(columns="text_norm").reset_index(drop=True)
+    return sauber, wahrheit
+
+
+# ---------------------------------------------------------------------------
+# Sitzung 5: Themen-Katalog und Wahrheit
+# ---------------------------------------------------------------------------
+THEMEN = ["Klang", "Geräuschunterdrückung", "Akku & Laden", "Tragekomfort",
+          "Verbindung", "Verarbeitung & Haltbarkeit", "Preis", "App & Bedienung"]
+
+_PHRASE_THEMA = {
+    "der klang ist hervorragend": ("Klang", "positiv"),
+    "satte bässe": ("Klang", "positiv"),
+    "der sound ist klar und ausgewogen": ("Klang", "positiv"),
+    "der bass ist matschig": ("Klang", "negativ"),
+    "die geräuschunterdrückung ist top": ("Geräuschunterdrückung", "positiv"),
+    "die geräuschunterdrückung rauscht": ("Geräuschunterdrückung", "negativ"),
+    "der akku hält den ganzen tag": ("Akku & Laden", "positiv"),
+    "der akku ist nach einer stunde leer": ("Akku & Laden", "negativ"),
+    "der rechte ohrhörer lädt nicht mehr": ("Akku & Laden", "negativ"),
+    "sitzt super bequem": ("Tragekomfort", "positiv"),
+    "die passform ist perfekt": ("Tragekomfort", "positiv"),
+    "sie fallen leicht aus dem ohr": ("Tragekomfort", "negativ"),
+    "bluetooth verbindet sofort": ("Verbindung", "positiv"),
+    "die verbindung bricht ab": ("Verbindung", "negativ"),
+    "top verarbeitet": ("Verarbeitung & Haltbarkeit", "positiv"),
+    "das case wirkt billig": ("Verarbeitung & Haltbarkeit", "negativ"),
+    "klasse für den preis": ("Preis", "positiv"),
+    "viel zu teuer": ("Preis", "negativ"),
+    "die app ist übersichtlich": ("App & Bedienung", "positiv"),
+    "die app stürzt ständig ab": ("App & Bedienung", "negativ"),
+    "die touch-steuerung reagiert kaum": ("App & Bedienung", "negativ"),
+}
+_SATZ_THEMEN = {
+    SARCASTIC[0]: [("Verarbeitung & Haltbarkeit", "negativ")],
+    SARCASTIC[1]: [("App & Bedienung", "negativ")],
+    SARCASTIC[2]: [("Preis", "negativ"), ("Klang", "negativ")],
+    SARCASTIC[3]: [("Akku & Laden", "negativ")],
+    SARCASTIC[4]: [("Klang", "negativ")],
+    SARCASTIC[5]: [("Tragekomfort", "negativ")],
+    SARCASTIC[6]: [("Verbindung", "negativ")],
+    SARCASTIC[7]: [("Verarbeitung & Haltbarkeit", "negativ")],
+    SARCASTIC[8]: [("App & Bedienung", "negativ")],
+    SARCASTIC[9]: [("Verarbeitung & Haltbarkeit", "negativ")],
+    ENGLISH[0][0]: [("Klang", "positiv"), ("App & Bedienung", "negativ")],
+    ENGLISH[1][0]: [("Akku & Laden", "positiv")],
+    ENGLISH[2][0]: [("Verarbeitung & Haltbarkeit", "negativ")],
+    ENGLISH[3][0]: [("Tragekomfort", "positiv"), ("Klang", "positiv")],
+    ENGLISH[4][0]: [("Geräuschunterdrückung", "negativ"), ("Verarbeitung & Haltbarkeit", "negativ")],
+}
+
+
+def wahre_themen(text_wahr):
+    """Liste von (thema, polaritaet) für einen Originaltext aus dem Generator."""
+    if text_wahr in _SATZ_THEMEN:
+        return list(_SATZ_THEMEN[text_wahr])
+    t = text_wahr.lower()
+    return [tp for phrase, tp in _PHRASE_THEMA.items() if phrase in t]
+
+
+# Mock für Themen: zählt nur wenige, wörtliche Stichwörter (keine Synonyme, keine Verneinung)
+_MOCK_STICHWORT = {"Klang": ["klang", "bass", "sound"], "Geräuschunterdrückung": ["geräuschunterdrückung"],
+                   "Akku & Laden": ["akku", "lädt"], "Tragekomfort": ["bequem", "passform"],
+                   "Verbindung": ["verbindung", "bluetooth"], "Verarbeitung & Haltbarkeit": ["verarbeitet", "case"],
+                   "Preis": ["preis", "teuer"], "App & Bedienung": ["app", "touch"]}
+
+
+def _mock_themen(text):
+    t = text.lower()
+    out = []
+    for thema, woerter in _MOCK_STICHWORT.items():
+        if any(w in t for w in woerter):
+            neg = any(w in t for w in _NEG)
+            pos = any(w in t for w in _POS)
+            out.append({"thema": thema, "polaritaet": "negativ" if neg and not pos else "positiv"})
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Sitzung 5: Embeddings
+# ---------------------------------------------------------------------------
+EMBED_MODELL = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+_embedder = None
+_tfidf = None
+
+
+def embed(texte, modell=EMBED_MODELL):
+    """Texte -> normierte Vektoren (numpy, eine Zeile pro Text).
+    Nutzt ein Sentence-Transformer-Modell (lokal, kein API-Schlüssel, kostenlos).
+    Ist das nicht verfügbar, Ersatz: TF-IDF auf Zeichen-Schnipseln (nur Schreibweise, keine Bedeutung)."""
+    global _embedder, _tfidf
+    texte = [str(t) for t in texte]
+    if _embedder is None:
+        try:
+            from sentence_transformers import SentenceTransformer
+            _embedder = SentenceTransformer(modell)
+            print(f"Embedding-Modell geladen: {modell}")
+        except Exception as e:
+            _embedder = "ersatz"
+            print(f"⚠️ Sentence-Transformers nicht verfügbar ({type(e).__name__}). "
+                  "Ersatz: TF-IDF auf Zeichen-Schnipseln. Ähnlichkeit = ähnliche Schreibweise, nicht Bedeutung.")
+    if _embedder == "ersatz":
+        from sklearn.feature_extraction.text import TfidfVectorizer
+        if _tfidf is None:
+            korpus = [w["text_wahr"] for _, w in export_roh()[1].iterrows()]
+            _tfidf = TfidfVectorizer(analyzer="char_wb", ngram_range=(3, 5)).fit(korpus + texte)
+        v = _tfidf.transform(texte).toarray()
+        return v / np.maximum(np.linalg.norm(v, axis=1, keepdims=True), 1e-12)
+    return _embedder.encode(texte, normalize_embeddings=True, show_progress_bar=False)
