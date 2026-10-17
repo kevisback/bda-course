@@ -2,6 +2,7 @@
 __pycache__/
 *.py[codz]
 *$py.class
+*.bak
 
 # C extensions
 *.so
@@ -226,3 +227,5 @@ secrets.*
 api_key*
 apikey*
 *_secret*
+
+externalize_images.py
