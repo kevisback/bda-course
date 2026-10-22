@@ -48,6 +48,7 @@ PREIS_OUTPUT_PRO_MTOK = 5.00
 FEHLERRATE = 0.0                      # Anteil simulierter Störungen (nur in simulation())
 MOCK_LATENZ = 0.02                    # Sekunden pro Mock-Aufruf
 CACHE_AKTIV = True
+TEMPERATUR_ERLAUBT = True          # wird False, wenn die API den Parameter ablehnt
 
 LABELS = ["positive", "negative", "mixed", "neutral"]
 
@@ -216,10 +217,23 @@ def _anthropic_call(system, user, temperature, max_tokens):
                   messages=[{"role": "user", "content": user}])
     if system:
         kwargs["system"] = system
-    if temperature is not None:
+    global TEMPERATUR_ERLAUBT
+    if temperature is not None and TEMPERATUR_ERLAUBT:
         # Neuere SDK-Versionen kennen den Parameter nicht mehr: direkt in den Request-Body
         kwargs["extra_body"] = {"temperature": temperature}
-    r = _client.messages.create(**kwargs)
+    try:
+        r = _client.messages.create(**kwargs)
+    except anthropic.BadRequestError as e:
+        # Lehnt die API den Parameter ab, einmal ohne ihn wiederholen und ab dann weglassen
+        if "extra_body" not in kwargs or "temperature" not in str(e):
+            raise
+        with _lock:
+            if TEMPERATUR_ERLAUBT:
+                TEMPERATUR_ERLAUBT = False
+                print("⚠️ Die API akzeptiert für dieses Modell keinen temperature-Parameter. "
+                      "Alle Aufrufe laufen ab jetzt mit der Standardeinstellung des Anbieters.")
+        kwargs.pop("extra_body")
+        r = _client.messages.create(**kwargs)
     text = next((b.text for b in r.content if hasattr(b, "text")), "")
     return {"text": text, "input_tokens": r.usage.input_tokens,
             "output_tokens": r.usage.output_tokens, "stop_reason": r.stop_reason,
